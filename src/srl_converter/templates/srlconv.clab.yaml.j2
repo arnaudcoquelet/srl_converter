@@ -1,0 +1,18 @@
+name: {{ lab_name }}
+prefix: ""
+topology:
+  nodes:
+    srl-current:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:{{ current_version }}
+      # provide the startup config file to convert
+      # can be a full config in json, or a partial config in cli format
+      startup-config: {{ current_config }}
+      type: {{ current_type }}
+    srl-target:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:{{ target_version }}
+      binds:
+        - conversion_files:{{ conversion_files_mount }}
+        - load_config:{{ load_config_mount }}
+      type: {{ target_type }}

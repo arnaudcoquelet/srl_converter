@@ -1,0 +1,9 @@
+private/
+.vscode
+test/
+
+README.txt
+
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc

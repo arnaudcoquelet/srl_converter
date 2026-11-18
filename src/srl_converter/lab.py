@@ -1,0 +1,465 @@
+from __future__ import annotations
+
+import json, re
+import logging
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Callable
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, ContextManager
+
+from jinja2 import Environment, PackageLoader
+
+
+logger = logging.getLogger("srl_converter")
+
+
+# Must match ``lab_name`` in srlconv.clab.yaml.j2 (used in paths under conversion_files).
+LAB_NAME = "conversion"
+# Topology node that carries the source (current) configuration; used for `clab save --node-filter`.
+CURRENT_TOPOLOGY_NODE = "srl-current"
+# Node that receives the converted config upgrade.
+TARGET_TOPOLOGY_NODE = "srl-target"
+
+# srl-target bind destinations (must match srlconv.clab.yaml.j2).
+CONVERSION_FILES_MOUNT = "/home/admin/conversion_files"
+LOAD_CONFIG_MOUNT = "/home/admin/load_config"
+# Host path relative to lab workdir; must match the bind source in the topology template.
+LOAD_CONFIG_HOST_RELPATH = "load_config"
+
+# ``clab exec -f json`` wraps results; ``stdout`` holds sr_cli output (string or embedded JSON).
+_SR_CLI_INFO_CANDIDATE = "sr_cli -e -d -- info /"
+_SR_CLI_INFO_FLAT = "sr_cli -e -d -- info flat /"
+
+
+def normalize_srlinux_version(value: str) -> str:
+    """Strip whitespace and optional leading v/V for container image tags (e.g. v25.10.1 -> 25.10.1)."""
+    v = value.strip()
+    if not v:
+        return v
+    if v.startswith(("v", "V")):
+        return v[1:]
+    return v
+
+
+def find_containerlab_cli() -> str | None:
+    """Return absolute path to ``containerlab`` or ``clab`` on ``PATH``, or ``None``."""
+    for name in ("containerlab", "clab"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def ensure_containerlab_cli() -> str:
+    """Resolve Containerlab CLI path or raise ``RuntimeError`` if not installed."""
+    raw = find_containerlab_cli()
+    if raw is None:
+        msg = (
+            "Neither 'containerlab' nor 'clab' was found on PATH. "
+            "Install Containerlab and ensure it is available in your environment."
+        )
+        raise RuntimeError(msg)
+    return str(Path(raw).resolve())
+
+
+
+def strip_ansi(text: str) -> str:
+  # Matches 7-bit and 8-bit ANSI escape sequences
+  ansi_escape = re.compile(r"""
+        \x1B  # ESC
+        (?:   # 7-bit C1 Fe (except CSI)
+            [@-Z\\-_]
+        |     # or [ for CSI, followed by a control sequence
+            \[
+            [0-?]*  # Parameter bytes
+            [ -/]*  # Intermediate bytes
+            [@-~]   # Final byte
+        )
+    """, re.VERBOSE)
+  return ansi_escape.sub("", text)
+
+def _log_clab_line(line: str) -> None:
+    text = line.rstrip("\n\r")
+    if not text:
+        return
+
+    ascii_only = strip_ansi(text)
+    logger.info(ascii_only)
+
+def _log_clab_captured(stdout: str | None, stderr: str | None) -> None:
+    for block in (stdout or "", stderr or ""):
+        for line in block.splitlines():
+            _log_clab_line(line)
+
+def _run_clab_deploy_streaming(*, cli: str, topology_file: str, workdir: Path) -> None:
+    cmd = [cli, "deploy", "-t", topology_file]
+    captured: list[str] = []
+    with subprocess.Popen(
+        cmd,
+        cwd=workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    ) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            captured.append(line)
+            _log_clab_line(line)
+        proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            cmd,
+            output="".join(captured),
+            stderr=None,
+        )
+
+def _run_clab_destroy_streaming(*, cli: str, topology_file: str, workdir: Path) -> None:
+    cmd = [cli, "destroy", "-t", topology_file, "--cleanup"]
+    captured: list[str] = []
+    with subprocess.Popen(
+        cmd,
+        cwd=workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    ) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            captured.append(line)
+            _log_clab_line(line)
+        proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            cmd,
+            output="".join(captured),
+            stderr=None,
+        )
+
+def _stdout_from_clab_exec_json(collection_json: str) -> str:
+    """Extract sr_cli ``stdout`` from ``clab exec -f json`` output (per containerlab/exec)."""
+    data = json.loads(collection_json)
+    if not isinstance(data, dict):
+        return collection_json
+    for _cid, results in data.items():
+        if not results or not isinstance(results, list):
+            continue
+        first = results[0]
+        if not isinstance(first, dict):
+            continue
+        out = first.get("stdout")
+        if out is None:
+            err = first.get("stderr")
+            if isinstance(err, str) and err.strip():
+                return err
+            continue
+        if isinstance(out, str):
+            return out
+        return json.dumps(out, indent=2)
+    return collection_json
+
+
+def _clab_exec_node_capture_json(
+    *,
+    cli: str,
+    topology_file: str,
+    workdir: Path,
+    node_name: str,
+    cmd: str,
+) -> str:
+    """Run ``clab exec -f json`` on a node and return decoded command stdout (not the wrapper tree)."""
+    proc = subprocess.run(
+        [
+            cli,
+            "exec",
+            "--log-level",
+            "error",
+            "-t",
+            topology_file,
+            "-f",
+            "json",
+            "--label",
+            f"clab-node-name={node_name}",
+            "--cmd",
+            cmd,
+        ],
+        cwd=workdir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return ""
+    try:
+        return _stdout_from_clab_exec_json(raw)
+    except json.JSONDecodeError:
+        logger.warning("clab exec -f json stdout was not valid JSON; saving raw")
+        return raw
+
+
+def _topology_file(topology_path: Path) -> str:
+    """Absolute path for ``clab -t`` (required for reliable exec/capture)."""
+    return str(topology_path.expanduser().resolve())
+
+
+def _clab_exec_target(
+    *,
+    cli: str,
+    topology_file: str,
+    workdir: Path,
+    cmd: str,
+) -> None:
+    proc = subprocess.run(
+        [
+            cli,
+            "exec",
+            "--log-level",
+            "error",
+            "-t",
+            topology_file,
+            "--label",
+            f"clab-node-name={TARGET_TOPOLOGY_NODE}",
+            "--cmd",
+            cmd,
+        ],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            proc.args,
+            output=proc.stdout,
+            stderr=proc.stderr,
+        )
+    _log_clab_captured(proc.stdout, proc.stderr)
+
+
+def destroy( workdir:Path =None, topology_path:Path =None ):
+    """Destroy lab"""
+    if workdir is None:
+        msg = f'workdir not provided'
+        return None
+
+    if not isinstance(workdir, Path):
+        msg = f'Incorrect format for workdir'
+        return None
+
+
+    if topology_path is None:
+        msg = f'Topology file not provided'
+        return None
+
+    if not isinstance(topology_path, Path):
+        msg = f'Incorrect format for topology_path'
+        return None
+
+    if topology_path.exists():
+        cli = ensure_containerlab_cli()
+
+        topology_file = _topology_file(topology_path)    
+        logger.info("Destroying old topology based on %s", topology_file)
+
+
+        _run_clab_destroy_streaming(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+        )
+
+    return None
+
+def prepare_and_deploy(
+    *,
+    output_folder: Path|None,
+    current_version: str,
+    current_config: Path,
+    current_type: str,
+    target_version: str,
+    target_type: str,
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path]:
+    """Deploy lab; store original + converted JSON and monolithic CLI dumps."""
+    config_path = current_config.resolve()
+    if not config_path.is_file():
+        msg = f"Configuration file not found: {config_path}"
+        raise FileNotFoundError(msg)
+
+    cv = normalize_srlinux_version(current_version)
+    tv = normalize_srlinux_version(target_version)
+
+    workdir=None
+    if output_folder is None:
+        msg = "Output folder not set"
+        raise FileNotFoundError(msg)
+
+    workdir = output_folder
+    diff_files = workdir / "diff_files"
+    conversion_files = workdir / "conversion_files"
+
+    env = Environment(
+        loader=PackageLoader("srl_converter", "templates"),
+        autoescape=False,
+    )
+
+    load_config_path = workdir / LOAD_CONFIG_HOST_RELPATH
+    load_body = env.get_template("load_config.j2").render(
+        lab_name=LAB_NAME,
+        conversion_files_mount=CONVERSION_FILES_MOUNT,
+        current_topology_node=CURRENT_TOPOLOGY_NODE,
+    )
+    load_config_path.write_text(load_body, encoding="utf-8")
+    subprocess.run(
+        ["chmod", "666", str(load_config_path.resolve())],
+        check=True,
+    )
+
+    template = env.get_template("srlconv.clab.yaml.j2")
+    body = template.render(
+        lab_name=LAB_NAME,
+        conversion_files_mount=CONVERSION_FILES_MOUNT,
+        load_config_mount=LOAD_CONFIG_MOUNT,
+        current_version=cv,
+        current_config=str(config_path),
+        current_type=current_type,
+        target_version=tv,
+        target_type=target_type,
+    )
+    topology_path = workdir / "srlconv.clab.yaml"
+    topology_path.write_text(body, encoding="utf-8")
+    topology_file = _topology_file(topology_path)
+
+    cli = ensure_containerlab_cli()
+
+    logger.info("Conversion workspace created at %s", workdir)
+    _run_clab_deploy_streaming(
+        cli=cli,
+        topology_file=topology_file,
+        workdir=workdir,
+    )
+
+    ctx = nullcontext()
+    with ctx:
+        logger.info("Collecting configuration files")
+        save_proc = subprocess.run(
+            [
+                cli,
+                "save",
+                "--copy",
+                str(conversion_files.resolve()),
+                "--node-filter",
+                CURRENT_TOPOLOGY_NODE,
+                "-t",
+                topology_file,
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if save_proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                save_proc.returncode,
+                save_proc.args,
+                output=save_proc.stdout,
+                stderr=save_proc.stderr,
+            )
+
+        subprocess.run(
+            ["chmod", "-R", "777", str(conversion_files.resolve())],
+            check=True,
+        )
+
+        output_dir = workdir / "output"
+        saved_json = (
+            conversion_files
+            / f"clab-{LAB_NAME}"
+            / CURRENT_TOPOLOGY_NODE
+            / "config.json"
+        )
+        if not saved_json.is_file():
+            msg = f"Expected saved config not found: {saved_json}"
+            raise FileNotFoundError(msg)
+        out_current_cfg = output_dir / f"{cv}.cfg.json"
+        shutil.copy2(saved_json, out_current_cfg)
+
+        cur_cli_txt = _clab_exec_node_capture_json(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            node_name=CURRENT_TOPOLOGY_NODE,
+            cmd=_SR_CLI_INFO_CANDIDATE,
+        )
+        out_current_cli = output_dir / f"{cv}.cli.txt"
+        out_current_cli.write_text(cur_cli_txt, encoding="utf-8")
+
+        cur_cli_flat_txt = _clab_exec_node_capture_json(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            node_name=CURRENT_TOPOLOGY_NODE,
+            cmd=_SR_CLI_INFO_FLAT,
+        )
+        out_current_cli_flat = output_dir / f"{cv}.cli-flat.txt"
+        out_current_cli_flat.write_text(cur_cli_flat_txt, encoding="utf-8")
+
+        upgrade_file_in_target = f"{CONVERSION_FILES_MOUNT}/clab-{LAB_NAME}/{CURRENT_TOPOLOGY_NODE}/config.json"
+        tools_line = f"tools system configuration upgrade file {upgrade_file_in_target}"
+        # Same line as in an interactive SR Linux session; wrapped for non-interactive use.
+        exec_cmd = f'sr_cli "{tools_line}"'
+        _clab_exec_target(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            cmd=exec_cmd,
+        )
+
+        load_exec = f"sh -c 'sr_cli < {LOAD_CONFIG_MOUNT}'"
+        _clab_exec_target(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            cmd=load_exec,
+        )
+
+        out_target_cfg = output_dir / f"{tv}.cfg.json"
+        shutil.copy2(saved_json, out_target_cfg)
+
+        tgt_cli_txt = _clab_exec_node_capture_json(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            node_name=TARGET_TOPOLOGY_NODE,
+            cmd=_SR_CLI_INFO_CANDIDATE,
+        )
+        out_target_cli = output_dir / f"{tv}.cli.txt"
+        out_target_cli.write_text(tgt_cli_txt, encoding="utf-8")
+
+        tgt_cli_flat_txt = _clab_exec_node_capture_json(
+            cli=cli,
+            topology_file=topology_file,
+            workdir=workdir,
+            node_name=TARGET_TOPOLOGY_NODE,
+            cmd=_SR_CLI_INFO_FLAT,
+        )
+        out_target_cli_flat = output_dir / f"{tv}.cli-flat.txt"
+        out_target_cli_flat.write_text(tgt_cli_flat_txt, encoding="utf-8")
+
+        return (
+            workdir,
+            out_current_cfg,
+            out_current_cli,
+            out_current_cli_flat,
+            out_target_cfg,
+            out_target_cli,
+            out_target_cli_flat,
+            topology_path
+        )
