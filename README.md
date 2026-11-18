@@ -18,7 +18,7 @@ Install with a single command:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-sh -s -- https://github.com/srl-labs/srlconv/archive/refs/heads/main.zip
+sh -s -- https://arnaudcoquelet/srl_converter/archive/refs/heads/main.zip
 ```
 
 ## Usage
